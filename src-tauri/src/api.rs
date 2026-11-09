@@ -362,26 +362,72 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
     state.get(&format!("/api/videos/{id}")).await
 }
 
-/// 播放地址是否为非空字符串。
-fn has_play_url(v: &Value) -> bool {
-    v.get("video_url")
-        .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty())
+/// 从响应里找出可播放地址：先认常见字段名，再退化为递归找 m3u8 字符串。
+fn find_play_url(v: &Value) -> Option<String> {
+    const KEYS: [&str; 8] = [
+        "video_url",
+        "play_url",
+        "playback_url",
+        "hls_url",
+        "m3u8",
+        "m3u8_url",
+        "url",
+        "src",
+    ];
+    if let Some(o) = v.as_object() {
+        for k in KEYS {
+            if let Some(s) = o.get(k).and_then(Value::as_str) {
+                if s.starts_with("http") {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(o) = v.as_object() {
+        for val in o.values() {
+            if let Some(s) = deepen_play_url(val) {
+                return Some(s);
+            }
+        }
+    } else if let Some(a) = v.as_array() {
+        for val in a {
+            if let Some(s) = deepen_play_url(val) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// 递归兜底：只接受明确像媒体清单的字符串，避免把封面图当播放地址。
+fn deepen_play_url(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if s.starts_with("http") && (s.contains(".m3u8") || s.contains("m3u8")) => {
+            Some(s.clone())
+        }
+        Value::Object(o) => o.values().find_map(deepen_play_url),
+        Value::Array(a) => a.iter().find_map(deepen_play_url),
+        _ => None,
+    }
+}
+
+fn keys_of(v: &Value) -> Vec<String> {
+    v.as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default()
+}
+
+fn shorten(s: &str) -> String {
+    let cut: String = s.chars().take(40).collect();
+    cut.replace('\n', " ")
 }
 
 /// 记录一次播放接口探测：只写字段名与结论，不写播放直链。
-fn record_play_probe(endpoint: &str, variant: &str, outcome: &str, payload: Option<&Value>, error: Option<&str>) {
-    let keys: Vec<String> = payload
-        .and_then(Value::as_object)
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
+fn record_play_probe(endpoint: &str, outcome: &str, payload: Option<&Value>, error: Option<&str>) {
     crate::playback_log::record(
         "play.probe",
         json!({
             "endpoint": endpoint,
-            "variant": variant,
             "outcome": outcome,
-            "keys": keys,
+            "keys": payload.map(keys_of).unwrap_or_default(),
             "error": error,
         }),
     );
@@ -390,33 +436,61 @@ fn record_play_probe(endpoint: &str, variant: &str, outcome: &str, payload: Opti
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
     // 上游已改用 POST /api/videos/{id}/episodes/{ep}/playback 下发播放地址；
-    // 旧的 GET /api/videos/{id}/play 仍返回 status:1，但 data 里不再带 video_url。
-    // 这里先试新接口（无 body 与空对象两种写法），全部拿不到地址再回退旧接口，
-    // 每次探测结果写入播放诊断日志，便于实机确认上游真实字段。
+    // 旧的 GET /api/videos/{id}/play 仍返回 status:1 但 data 里已没有 video_url。
+    // 这里按候选矩阵逐个探测，命中即返回，全部落空时把每个候选的返回字段带回界面。
     let new_path = format!("/api/videos/{id}/episodes/{ep}/playback");
-    for (variant, body) in [("none", None), ("empty_object", Some(json!({})))] {
-        match state.post_optional(&new_path, body).await {
-            Ok(v) if has_play_url(&v) => {
-                record_play_probe("new", variant, "ok", Some(&v), None);
-                return Ok(v);
-            }
-            Ok(v) => record_play_probe("new", variant, "empty", Some(&v), None),
-            Err(e) => record_play_probe("new", variant, "error", None, Some(e.as_str())),
-        }
-    }
+    let candidates: Vec<(&str, &str, String, Option<Value>)> = vec![
+        ("episodes_playback", "POST", new_path.clone(), None),
+        ("episodes_playback_json", "POST", new_path.clone(), Some(json!({}))),
+        ("episodes_playback_ep", "POST", new_path.clone(), Some(json!({ "ep": ep }))),
+        (
+            "playback_request",
+            "POST",
+            "/api/playback/request".to_string(),
+            Some(json!({ "video_id": id, "ep": ep })),
+        ),
+        (
+            "legacy_play",
+            "GET",
+            format!("/api/videos/{id}/play?ep={ep}&page_texts=0"),
+            None,
+        ),
+    ];
 
-    let old_path = format!("/api/videos/{id}/play?ep={ep}&page_texts=0");
-    match state.get(&old_path).await {
-        Ok(v) => {
-            let outcome = if has_play_url(&v) { "ok" } else { "empty" };
-            record_play_probe("old", "get", outcome, Some(&v), None);
-            Ok(v)
-        }
-        Err(e) => {
-            record_play_probe("old", "get", "error", None, Some(e.as_str()));
-            Err(e)
+    let mut summary: Vec<String> = Vec::new();
+    for (label, method, path, body) in candidates {
+        let res = if method == "GET" {
+            state.get(&path).await
+        } else {
+            state.post_optional(&path, body).await
+        };
+        match res {
+            Ok(v) => {
+                if let Some(url) = find_play_url(&v) {
+                    let mut out = v.clone();
+                    let missing = out
+                        .get("video_url")
+                        .and_then(Value::as_str)
+                        .map_or(true, str::is_empty);
+                    if missing {
+                        if let Some(o) = out.as_object_mut() {
+                            o.insert("video_url".to_string(), Value::String(url));
+                        }
+                    }
+                    record_play_probe(label, "ok", Some(&v), None);
+                    return Ok(out);
+                }
+                let keys = keys_of(&v);
+                summary.push(format!("{}:empty[{}]", label, keys.join(",")));
+                record_play_probe(label, "empty", Some(&v), None);
+            }
+            Err(e) => {
+                summary.push(format!("{}:{}", label, shorten(&e)));
+                record_play_probe(label, "error", None, Some(e.as_str()));
+            }
         }
     }
+    Err(format!("暂无播放地址（{}）", summary.join("；")))
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */

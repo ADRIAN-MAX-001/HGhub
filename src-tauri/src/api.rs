@@ -31,6 +31,13 @@ impl Api {
             .ok_or_else(|| "请先登录".to_string())?;
         edge(&origin, method, path, body, Some(&token)).await
     }
+
+    /// 可选登录的 POST：新播放接口对游客也可能开放，未登录时不带 Authorization。
+    async fn post_optional(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
+        let origin = base();
+        let token = self.session.token(&origin);
+        edge(&origin, "POST", path, body, token.as_deref()).await
+    }
 }
 
 /// API/运行错误与自检统一写入 debug.log，每行附 RFC 3339 UTC 时间和进程编号。
@@ -355,11 +362,61 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
     state.get(&format!("/api/videos/{id}")).await
 }
 
+/// 播放地址是否为非空字符串。
+fn has_play_url(v: &Value) -> bool {
+    v.get("video_url")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// 记录一次播放接口探测：只写字段名与结论，不写播放直链。
+fn record_play_probe(endpoint: &str, variant: &str, outcome: &str, payload: Option<&Value>, error: Option<&str>) {
+    let keys: Vec<String> = payload
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    crate::playback_log::record(
+        "play.probe",
+        json!({
+            "endpoint": endpoint,
+            "variant": variant,
+            "outcome": outcome,
+            "keys": keys,
+            "error": error,
+        }),
+    );
+}
+
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    state
-        .get(&format!("/api/videos/{id}/play?ep={ep}&page_texts=0"))
-        .await
+    // 上游已改用 POST /api/videos/{id}/episodes/{ep}/playback 下发播放地址；
+    // 旧的 GET /api/videos/{id}/play 仍返回 status:1，但 data 里不再带 video_url。
+    // 这里先试新接口（无 body 与空对象两种写法），全部拿不到地址再回退旧接口，
+    // 每次探测结果写入播放诊断日志，便于实机确认上游真实字段。
+    let new_path = format!("/api/videos/{id}/episodes/{ep}/playback");
+    for (variant, body) in [("none", None), ("empty_object", Some(json!({})))] {
+        match state.post_optional(&new_path, body).await {
+            Ok(v) if has_play_url(&v) => {
+                record_play_probe("new", variant, "ok", Some(&v), None);
+                return Ok(v);
+            }
+            Ok(v) => record_play_probe("new", variant, "empty", Some(&v), None),
+            Err(e) => record_play_probe("new", variant, "error", None, Some(e.as_str())),
+        }
+    }
+
+    let old_path = format!("/api/videos/{id}/play?ep={ep}&page_texts=0");
+    match state.get(&old_path).await {
+        Ok(v) => {
+            let outcome = if has_play_url(&v) { "ok" } else { "empty" };
+            record_play_probe("old", "get", outcome, Some(&v), None);
+            Ok(v)
+        }
+        Err(e) => {
+            record_play_probe("old", "get", "error", None, Some(e.as_str()));
+            Err(e)
+        }
+    }
 }
 
 /* ───────────────────────── 评论 / 互动 ───────────────────────── */
